@@ -73,3 +73,5 @@ def get_acc(model, dataloader, device):
         print(f"Test Accuracy: {accuracy:.4f}")
 
     return accuracy
+
+
