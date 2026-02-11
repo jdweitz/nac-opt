@@ -215,7 +215,7 @@ class GlobalSearchTF:
             "board": "zcu102"
         }
 
-    def create_block_objective(self, x_train, y_train, x_val, y_val, epochs=10, use_hardware_metrics=False, verbose=True, one_hot= False):
+    def create_block_objective(self, x_train, y_train, x_val, y_val, epochs=10, use_hardware_metrics=True, verbose=True, one_hot= False):
         """Creates the objective function for Optuna to optimize."""
         def objective(trial):
             try:
@@ -309,7 +309,10 @@ class GlobalSearchTF:
                 })
                 bops += estimate_mlp_bops(mlp_widths)
 
-                input_shape = (img_size, img_size, x_train.shape[-1])
+                # IMPORTANT: use the actual dataset shape, not (img_size, img_size, C)
+                input_shape = tuple(x_train.shape[1:])
+
+                # input_shape = (img_size, img_size, x_train.shape[-1])
                 model = BlockArchitectureTF(feature_extractor_blocks, classifier_head, input_shape, needs_flattening=(not is_flattened))
                 
                 model.compile(optimizer='adam', loss=loss_function, metrics=['accuracy'])
@@ -318,32 +321,87 @@ class GlobalSearchTF:
                 val_metrics = evaluate_model(model, (x_val, y_val))
                 performance_metric = val_metrics['accuracy']
                 
+                # NEW: rule4ml metrics for block-based models
+                if use_hardware_metrics:
+                    avg_resource, clock_cycles = self.calculate_hardware_metrics(model, input_shape)
+                else:
+                    avg_resource, clock_cycles = 0.0, 0.0
+
                 model_details = {
-                    'metadata': {'trial_id': trial.number, 'global_search_accuracy': float(performance_metric), 'global_search_bops': float(bops)},
-                    'architecture': {
-                        'model_type': 'BlockBased',
-                        'input_shape': list(input_shape),
-                        'output_dim': output_dim,
-                        'components': model_components
-                    }
+                    "metadata": {
+                        "trial_id": trial.number,
+                        "global_search_accuracy": float(performance_metric),
+                        "global_search_bops": float(bops),
+                    },
+                    "architecture": {
+                        "model_type": "BlockBased",
+                        "input_shape": list(input_shape),
+                        "output_dim": output_dim,
+                        "components": model_components,
+                    },
                 }
                 trial_yaml_path = os.path.join(self.results_dir, f"trial_{trial.number}_arch.yaml")
                 _save_architecture_to_yaml(model_details, trial_yaml_path)
-                
-                if verbose:
-                    print(f"Trial {trial.number}: Accuracy={performance_metric:.4f}, BOPs={bops}")
 
-                self.results.append({
-                    'trial': trial.number, 'performance_metric': performance_metric, 'bops': bops, 
-                    'params': trial.params, 'yaml_path': trial_yaml_path
-                })
+                if verbose:
+                    if use_hardware_metrics:
+                        print(
+                            f"Trial {trial.number}: Acc={performance_metric:.4f}, BOPs={bops}, "
+                            f"Res={avg_resource:.2f}, Cycles={clock_cycles:.0f}"
+                        )
+                    else:
+                        print(f"Trial {trial.number}: Accuracy={performance_metric:.4f}, BOPs={bops}")
+
+                result_row = {
+                    "trial": trial.number,
+                    "performance_metric": performance_metric,
+                    "bops": bops,
+                    "params": trial.params,
+                    "yaml_path": trial_yaml_path,
+                }
+                if use_hardware_metrics:
+                    result_row["avg_resource"] = float(avg_resource)
+                    result_row["clock_cycles"] = float(clock_cycles)
+                self.results.append(result_row)
+
+                if use_hardware_metrics:
+                    return performance_metric, bops, avg_resource, clock_cycles
                 return performance_metric, bops
-            
+
             except Exception as e:
                 print(f"Trial {trial.number} failed with error: {e}")
+                if use_hardware_metrics:
+                    return 0.0, 1e12, 100.0, 1e9
                 return 0.0, 1e12
 
         return objective
+
+        #         model_details = {
+        #             'metadata': {'trial_id': trial.number, 'global_search_accuracy': float(performance_metric), 'global_search_bops': float(bops)},
+        #             'architecture': {
+        #                 'model_type': 'BlockBased',
+        #                 'input_shape': list(input_shape),
+        #                 'output_dim': output_dim,
+        #                 'components': model_components
+        #             }
+        #         }
+        #         trial_yaml_path = os.path.join(self.results_dir, f"trial_{trial.number}_arch.yaml")
+        #         _save_architecture_to_yaml(model_details, trial_yaml_path)
+                
+        #         if verbose:
+        #             print(f"Trial {trial.number}: Accuracy={performance_metric:.4f}, BOPs={bops}")
+
+        #         self.results.append({
+        #             'trial': trial.number, 'performance_metric': performance_metric, 'bops': bops, 
+        #             'params': trial.params, 'yaml_path': trial_yaml_path
+        #         })
+        #         return performance_metric, bops
+            
+        #     except Exception as e:
+        #         print(f"Trial {trial.number} failed with error: {e}")
+        #         return 0.0, 1e12
+
+        # return objective
 
     def calculate_mlp_bops_tf(self, model, input_size, bit_width=32):
         """
@@ -598,78 +656,126 @@ class GlobalSearchTF:
 
         return objective
 
+    # def calculate_hardware_metrics(self, model, input_shape):
+    #     """
+    #     Calculate hardware metrics using rule4ml.
+    #     Parameters:
+    #         model: TensorFlow model
+    #         input_shape: The input dimension for the model, required for patching.
+            
+    #     Returns:
+    #         tuple: (avg_resource, clock_cycles)
+    #     """
+    #     try:
+    #         from rule4ml.models.wrappers import MultiModelWrapper
+            
+    #         # Patch model layers with shape info, which is required by rule4ml.
+    #         # this was needed to get correct input shape for rule4ml, need to adjust for the block search
+    #         for layer in model.layers:
+    #             if hasattr(layer, "input_spec") and layer.input_spec and layer.input_spec.shape:
+    #                 layer._build_shapes_dict = {"input": layer.input_spec.shape}
+    #             elif hasattr(layer, "input_shape") and layer.input_shape is not None:
+    #                 layer._build_shapes_dict = {"input": layer.input_shape}
+    #             else:
+    #                 # Fallback for the first layer if shape is not yet inferred
+    #                 if isinstance(input_shape, (list, tuple)):
+    #                     layer._build_shapes_dict = {"input": (None, *input_shape)}
+    #                 else:
+    #                     layer._build_shapes_dict = {"input": (None, input_shape)}
+
+    #         estimator = MultiModelWrapper()
+    #         estimator.load_default_models()
+
+    #         pred_df = estimator.predict([model], hls_configs=[self.hls_config])
+            
+    #         if not pred_df.empty:
+    #             results = pred_df.iloc[0]
+    #             lut = results.get("LUT (%)", 0)
+    #             ff = results.get("FF (%)", 0)
+    #             bram = results.get("BRAM (%)", 0)
+    #             dsp = results.get("DSP (%)", 0)
+    #             avg_resource = np.mean([lut, ff, bram, dsp])
+    #             clock_cycles = results.get('CYCLES', 1e9) # High default
+    #         else:
+    #             print("Warning: Hardware estimation failed to return results. Returning high-penalty default values.")
+    #             avg_resource = 100.0
+    #             clock_cycles = 1e9
+
+    #         return avg_resource, clock_cycles
+            
+    #     except ImportError:
+    #         # Re-raise to ensure the user knows rule4ml is missing
+    #         raise ImportError("rule4ml package is required for hardware metrics calculation. Please install it.")
+    #     except Exception as e:
+    #         # Catch other potential errors from the estimator
+    #         print(f"An error occurred during hardware estimation: {e}. Returning high-penalty dummy values.")
+    #         return 100.0, 1e9
+
     def calculate_hardware_metrics(self, model, input_shape):
         """
-        Calculate hardware metrics using rule4ml.
+        Calculate hardware metrics using rule4ml for any Keras model, including subclassed models
+        (e.g., BlockArchitectureTF).
+
         Parameters:
-            model: TensorFlow model
-            input_shape: The input dimension for the model, required for patching.
-            
+            model: tf.keras.Model
+            input_shape: tuple/list/int WITHOUT batch dim, e.g. (64,) or (16,16,1)
+
         Returns:
-            tuple: (avg_resource, clock_cycles)
+            (avg_resource, clock_cycles)
         """
-        # try:
-        #     from rule4ml.models.estimators import MultiModelEstimator
-            
-        #     # Patch model layers with shape info, which is required by rule4ml.
-        #     for layer in model.layers:
-        #         if hasattr(layer, "input_spec") and layer.input_spec and layer.input_spec.shape:
-        #             layer._build_shapes_dict = {"input": layer.input_spec.shape}
-        #         elif hasattr(layer, "input_shape") and layer.input_shape is not None:
-        #             layer._build_shapes_dict = {"input": layer.input_shape}
-        #         else:
-        #             # Fallback for the first layer if shape is not yet inferred
-        #             if isinstance(input_shape, (list, tuple)):
-        #                 layer._build_shapes_dict = {"input": (None, *input_shape)}
-        #             else:
-        #                 layer._build_shapes_dict = {"input": (None, input_shape)}
-
-        #     estimator = MultiModelEstimator()
-        #     estimator.load_default_models()
-            
-        #     pred_df = estimator.predict([model], [self.hls_config])
-
         try:
             from rule4ml.models.wrappers import MultiModelWrapper
-            
-            # Patch model layers with shape info, which is required by rule4ml.
-            for layer in model.layers:
-                if hasattr(layer, "input_spec") and layer.input_spec and layer.input_spec.shape:
-                    layer._build_shapes_dict = {"input": layer.input_spec.shape}
-                elif hasattr(layer, "input_shape") and layer.input_shape is not None:
-                    layer._build_shapes_dict = {"input": layer.input_shape}
-                else:
-                    # Fallback for the first layer if shape is not yet inferred
-                    if isinstance(input_shape, (list, tuple)):
-                        layer._build_shapes_dict = {"input": (None, *input_shape)}
-                    else:
-                        layer._build_shapes_dict = {"input": (None, input_shape)}
+
+            # Normalize input_shape to tuple (no batch dim)
+            if isinstance(input_shape, int):
+                input_shape = (int(input_shape),)
+            elif isinstance(input_shape, list):
+                input_shape = tuple(input_shape)
+            elif isinstance(input_shape, tuple):
+                pass
+            else:
+                raise TypeError(f"Unsupported input_shape type: {type(input_shape)}")
+
+            # Ensure model is built (critical for subclassed models)
+            try:
+                dummy = tf.zeros((1, *input_shape), dtype=tf.float32)
+                _ = model(dummy, training=False)
+            except Exception as e:
+                raise RuntimeError(f"Failed to build model with dummy input shape {(1, *input_shape)}: {e}")
+
+            # Rule4ML sometimes expects per-layer build shapes; patch submodules safely.
+            # Use model.submodules (exists for subclassed models); skip the model itself.
+            for layer in getattr(model, "submodules", []):
+                if layer is model:
+                    continue
+                if not hasattr(layer, "_build_shapes_dict"):
+                    # only add if missing; avoid clobbering
+                    if hasattr(layer, "input_spec") and layer.input_spec and getattr(layer.input_spec, "shape", None):
+                        layer._build_shapes_dict = {"input": layer.input_spec.shape}
+                    elif hasattr(layer, "input_shape") and getattr(layer, "input_shape", None) is not None:
+                        layer._build_shapes_dict = {"input": layer.input_shape}
 
             estimator = MultiModelWrapper()
             estimator.load_default_models()
 
             pred_df = estimator.predict([model], hls_configs=[self.hls_config])
-            
+
             if not pred_df.empty:
                 results = pred_df.iloc[0]
                 lut = results.get("LUT (%)", 0)
                 ff = results.get("FF (%)", 0)
                 bram = results.get("BRAM (%)", 0)
                 dsp = results.get("DSP (%)", 0)
-                avg_resource = np.mean([lut, ff, bram, dsp])
-                clock_cycles = results.get('CYCLES', 1e9) # High default
-            else:
-                print("Warning: Hardware estimation failed to return results. Returning high-penalty default values.")
-                avg_resource = 100.0
-                clock_cycles = 1e9
+                avg_resource = float(np.mean([lut, ff, bram, dsp]))
+                clock_cycles = float(results.get("CYCLES", 1e9))
+                return avg_resource, clock_cycles
 
-            return avg_resource, clock_cycles
-            
+            print("Warning: Hardware estimation returned empty results. Returning high-penalty default values.")
+            return 100.0, 1e9
+
         except ImportError:
-            # Re-raise to ensure the user knows rule4ml is missing
             raise ImportError("rule4ml package is required for hardware metrics calculation. Please install it.")
         except Exception as e:
-            # Catch other potential errors from the estimator
             print(f"An error occurred during hardware estimation: {e}. Returning high-penalty dummy values.")
             return 100.0, 1e9
 
